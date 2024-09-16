@@ -12,28 +12,37 @@ async function detectRoomId(url, duration = 30000, streamKey, rtmpServerUrl) {
     let roomId = null;
     let aid = null;
 
-    // Listen for network requests
-    page.on('request', async (request) => {
+    // Listen for network requests and responses
+    page.on('response', async (response) => {
         try {
-            const requestUrl = request.url();
+            const responseUrl = response.url();
 
-            // Listen for the TikTok API request containing the "current_room_id"
-            if (requestUrl.includes('webcast/user')) {
-                const urlParams = new URLSearchParams(requestUrl.split('?')[1]);
-                roomId = urlParams.get('current_room_id'); // Extract the room ID from the URL params
-                aid = urlParams.get('aid'); // Extract the room ID from the URL params
-                
-                if (roomId) {
+            // Check if the response is from the "check_alive" API
+            if (responseUrl.includes('webcast/room/check_alive')) {
+                const responseData = await response.json(); // Parse the JSON response
+
+                if (responseData.data && responseData.data.length > 0 && responseData.data[0].alive) {
+                    roomId = responseData.data[0].room_id_str; // Extract room_id_str
                     console.log(`Room ID Detected: ${roomId}`);
-                    console.log(`aid Detected: ${aid}`);
 
-                    // If the room ID is found, stop the network listening and proceed to fetch HLS URL
-                    await fetchHlsUrl(aid, roomId, rtmpServerUrl, streamKey);
-                    await browser.close();
+                    // Now we need to retrieve `aid` from the request that triggered this response
+                    page.on('request', async (request) => {
+                        if (request.url().includes('webcast/room/check_alive')) {
+                            const urlParams = new URLSearchParams(request.url().split('?')[1]);
+                            aid = urlParams.get('aid'); // Extract the aid parameter
+                            console.log(`aid Detected: ${aid}`);
+
+                            // If both roomId and aid are available, fetch HLS URL
+                            if (roomId && aid) {
+                                await fetchHlsUrl(aid, roomId, rtmpServerUrl, streamKey);
+                                await browser.close();
+                            }
+                        }
+                    });
                 }
             }
         } catch (error) {
-            console.error(`Error processing request: ${error}`);
+            console.error(`Error processing response: ${error}`);
         }
     });
 
@@ -57,13 +66,13 @@ async function detectRoomId(url, duration = 30000, streamKey, rtmpServerUrl) {
     await new Promise(resolve => setTimeout(resolve, duration));
 
     // If no Room ID is detected, close the browser after the timeout
-    if (!roomId) {
-        console.log("No Room ID detected after the timeout.");
+    if (!roomId || !aid) {
+        console.log("No Room ID or aid detected after the timeout.");
         await browser.close();
     }
 }
 
-// Function to fetch HLS URL using Room ID
+// Function to fetch HLS URL using Room ID and aid
 async function fetchHlsUrl(aid, roomId, rtmpServerUrl, streamKey) {
     const roomInfoUrl = `https://webcast.tiktok.com/webcast/room/info/?aid=${aid}&room_id=${roomId}`;
     try {
@@ -72,7 +81,11 @@ async function fetchHlsUrl(aid, roomId, rtmpServerUrl, streamKey) {
         const roomInfoData = response.data;
 
         if (roomInfoData.data) {
-            const hlsPullUrl = roomInfoData.data.stream_url.hls_pull_url;
+            let hlsPullUrl = roomInfoData.data.stream_url.hls_pull_url;
+
+            // Remove everything after the "?" if it exists
+            hlsPullUrl = hlsPullUrl.split('?')[0];
+
             console.log(`HLS URL Detected: ${hlsPullUrl}`);
 
             // Forward HLS stream to RTMP server
@@ -93,7 +106,7 @@ function forwardToRTMPServer(hlsUrl, rtmpServerUrl, streamKey) {
     // FFmpeg command to forward the HLS stream to the RTMP server
     const ffmpegCommand = `ffmpeg -i "${hlsUrl}" -ar 44100 -vcodec libx264 -r 25 -b:v 500k -f flv ${fullRtmpUrl}`;
 
-    //Execute the FFmpeg command
+    // Execute the FFmpeg command
     exec(ffmpegCommand, (error, stdout, stderr) => {
         if (error) {
             console.error(`Error during FFmpeg execution: ${error.message}`);
